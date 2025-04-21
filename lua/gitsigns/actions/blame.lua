@@ -2,6 +2,7 @@ local async = require('gitsigns.async')
 local cache = require('gitsigns.cache').cache
 local log = require('gitsigns.debug.log')
 local util = require('gitsigns.util')
+local config = require('gitsigns.config').config
 
 local get_temp_hl = require('gitsigns.highlight').get_temp_hl
 
@@ -193,12 +194,26 @@ end
 --- @async
 --- @param win integer
 --- @param bwin integer
---- @param open 'vsplit'|'tabnew'
+--- @param open 'vsplit'|'tabnew'|'diffview'
 --- @param bcache Gitsigns.CacheEntry
 local function show_commit(win, bwin, open, bcache)
   local cursor = api.nvim_win_get_cursor(bwin)[1]
   local blame = assert(bcache.blame)
   local sha = assert(blame.entries[cursor]).commit.sha
+
+  if open == 'diffview' then
+    local has_diffview, _ = pcall(require, 'diffview')
+    if has_diffview then
+      vim.cmd('DiffviewOpen ' .. sha)
+    else
+      vim.notify(
+        'Gitsigns: use_diffview_for_blame is true, but Diffview is not installed or available.',
+        vim.log.levels.WARN
+      )
+    end
+    return
+  end
+
   api.nvim_set_current_win(win)
   require('gitsigns.actions.show_commit')(sha, open)
 end
@@ -427,26 +442,35 @@ function M.blame()
   })
 
   pmap('n', 's', function()
-    async.run(show_commit, win, blm_win, 'vsplit', bcache):raise_on_error()
+    local open_mode = config.use_diffview_for_blame and 'diffview' or 'vsplit'
+    async.run(show_commit, win, blm_win, open_mode, bcache):raise_on_error()
   end, {
-    desc = 'Show commit in a vertical split',
+    desc = config.use_diffview_for_blame and 'Show commit (Diffview)' or 'Show commit (vsplit)',
     buffer = blm_bufnr,
   })
 
-  pmap('n', 'S', function()
-    async.run(show_commit, win, blm_win, 'tabnew', bcache):raise_on_error()
-  end, {
-    desc = 'Show commit in a new tab',
-    buffer = blm_bufnr,
-  })
+  if not config.use_diffview_for_blame then
+    pmap('n', 'S', function()
+      async.run(show_commit, win, blm_win, 'tabnew', bcache):raise_on_error()
+    end, {
+      desc = 'Show commit (tab)',
+      buffer = blm_bufnr,
+    })
+  end
 
-  menu('GitsignsBlame', {
+  local menu_items = {
     { 'Reblame at commit', 'r' },
     { 'Reblame at commit parent', 'R' },
     { 'Diff (tab)', 'd' },
-    { 'Show commit (vsplit)', 's' },
-    { '            (tab)', 'S' },
-  })
+  }
+  if config.use_diffview_for_blame then
+    table.insert(menu_items, { 'Show commit (Diffview)', 's' })
+  else
+    table.insert(menu_items, { 'Show commit (vsplit)', 's' })
+    table.insert(menu_items, { '            (tab)', 'S' })
+  end
+
+  menu('GitsignsBlame', menu_items)
 
   local group = api.nvim_create_augroup('GitsignsBlame', {})
 

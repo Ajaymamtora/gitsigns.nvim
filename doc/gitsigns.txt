@@ -1418,5 +1418,14 @@ GitSignsUpdate     After Gitsigns updates its knowledge about hunks.
 GitSignsChanged    After any event in which Gitsigns can potentially change
                    the repository. Provides `file` in the autocmd user data.
 
+GitSignsHeadChanged Fired when gitsigns detects (via its filesystem watcher on `.git/HEAD`)
+                    that the currently checked-out reference (branch or commit SHA) has changed in the repository associated with the current working directory.
+                    * `event.data`: `{ gitdir = <string>, head = <string>, old_head = <string|nil>, detached = <boolean> }`
+                    * `gitdir`: Absolute path to the `.git` directory.
+                    * `head`: The new processed head reference (e.g., `main`, `feature/xyz`, `a1b2c3d`, `a1b2c3d(rebasing)`). This is the same value as `vim.b[bufnr].gitsigns_head` / `vim.g.gitsigns_head`.
+                    * `old_head`: The previous value of the head reference (can be `nil` on initial load).
+                    * init True only on the initial setup
+                    * `detached`: `true` if the new `HEAD` points directly to a commit SHA (detached HEAD state), `false` otherwise.
+
 ------------------------------------------------------------------------------
 vim:tw=78:ts=8:ft=help:norl:

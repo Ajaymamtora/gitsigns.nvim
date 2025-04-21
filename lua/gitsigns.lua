@@ -20,7 +20,8 @@ end
 
 --- @async
 --- @return string? gitdir
---- @return string? head
+--- @return string? head Processed head string
+--- @return string? raw_head Raw output from `git rev-parse --abbrev-ref HEAD`
 local function get_gitdir_and_head()
   local cwd = uv.cwd()
   if not cwd then
@@ -36,16 +37,21 @@ local function get_gitdir_and_head()
     for _, bcache in pairs(require('gitsigns.cache').cache) do
       local repo = bcache.git_obj.repo
       if repo.toplevel == cwd then
-        return repo.gitdir, repo.abbrev_head
+        -- Need raw_head from cache if possible? For now, re-parse if not found in cache quickly.
+        -- If we stored RepoInfo in cache, we could use it. Let's stick to re-parsing for simplicity now.
+        break -- Found repo, but might need re-parse for raw_head consistency
       end
     end
   end
 
+  -- Get full info including raw_head
   local info = require('gitsigns.git').Repo.get_info(cwd)
 
   if info then
-    return info.gitdir, info.abbrev_head
+    -- Return gitdir, processed head, and raw head
+    return info.gitdir, info.abbrev_head, info.raw_head
   end
+  return nil, nil, nil -- Return nils if no info
 end
 
 ---Sets up the cwd watcher to detect branch changes using uv.loop
@@ -75,37 +81,79 @@ local function setup_cwd_watcher(cwd, towatch)
   local update_head = debounce_trailing(100, function()
     async()
       .run(function()
-        local git = require('gitsigns.git')
-        local info = git.Repo.get_info(cwd) or {}
-        local new_head = info.abbrev_head
+        local __FUNC__ = 'update_head_callback'
+        -- Fetch gitdir, processed head, and RAW head
+        local gitdir, current_head, raw_head = get_gitdir_and_head()
         async().schedule()
-        if new_head ~= vim.g.gitsigns_head then
-          vim.g.gitsigns_head = new_head
+
+        if not gitdir then
+          log().dprint('Could not determine git directory for cwd watcher.')
+          return
+        end
+
+        local old_head = vim.g.gitsigns_head -- Store the previous processed head
+
+        -- Check if the processed head string actually changed
+        if current_head ~= old_head then
+          log().dprintf(
+            'Head changed from "%s" to "%s" in %s',
+            old_head or 'nil',
+            current_head or 'nil',
+            gitdir
+          )
+          vim.g.gitsigns_head = current_head -- Update the global variable
+
+          -- Determine detached status based on the RAW head reference
+          -- It's detached if the raw reference is exactly 'HEAD'
+          local is_detached = (raw_head == 'HEAD')
+
+          -- Trigger the GitSignsHeadChanged event with the enhanced data
+          api.nvim_exec_autocmds('User', {
+            pattern = 'GitSignsHeadChanged',
+            modeline = false,
+            data = {
+              gitdir = gitdir,
+              head = current_head, -- The new processed head (branch or SHA)
+              old_head = old_head, -- The previous processed head
+              detached = is_detached, -- Boolean flag for detached state
+            },
+          })
+
+          -- Trigger the existing GitSignsUpdate event
           api.nvim_exec_autocmds('User', {
             pattern = 'GitSignsUpdate',
             modeline = false,
           })
+        else
+          log().dprint('Head unchanged: ', current_head or 'nil')
         end
       end)
       :raise_on_error()
   end)
 
   -- Watch .git/HEAD to detect branch changes
-  cwd_watcher:start(towatch, {}, function()
-    async().run(function(err)
-      local __FUNC__ = 'cwd_watcher_cb'
+  cwd_watcher:start(towatch, {}, function(err, filename, event)
+    async().run(function()
+      local __FUNC__ = 'cwd_watcher_fs_event_cb'
       if err then
         log().dprintf('Git dir update error: %s', err)
         return
       end
-      log().dprint('Git cwd dir update')
+      log().dprintf("Git HEAD update detected: '%s' %s", filename or 'nil', vim.inspect(event))
 
-      update_head()
+      update_head() -- Call the debounced function
 
-      -- git often (always?) replaces .git/HEAD which can change the inode being
-      -- watched so we need to stop the current watcher and start another one to
-      -- make sure we keep getting future events
-      setup_cwd_watcher(cwd, towatch)
+      -- Re-register watcher logic (seems correct in the original code)
+      -- Ensure the path 'towatch' is still valid before restarting
+      if uv.fs_stat(towatch) then
+        setup_cwd_watcher(cwd, towatch)
+      else
+        log().dprintf('Watched path %s no longer exists, stopping watcher.', towatch)
+        if cwd_watcher and not cwd_watcher:is_closing() then
+          cwd_watcher:close()
+          cwd_watcher = nil
+        end
+      end
     end)
   end)
 end
@@ -113,11 +161,12 @@ end
 --- @async
 local function update_cwd_head()
   local cwd = uv.cwd()
-
   if not cwd then
+    log().dprint('Could not get current working directory.')
     return
   end
 
+  -- Find .git directory (existing logic is fine)
   local paths = vim.fs.find('.git', {
     limit = 1,
     upward = true,
@@ -125,25 +174,75 @@ local function update_cwd_head()
   })
 
   if #paths == 0 then
+    log().dprint('No .git directory found upwards from CWD.')
+    -- Clear potentially stale global head if we're no longer in a git repo
+    if vim.g.gitsigns_head ~= nil then
+      vim.g.gitsigns_head = nil
+      api.nvim_exec_autocmds('User', { pattern = 'GitSignsUpdate', modeline = false })
+    end
+    -- Stop watcher if it was running for a previous git dir
+    if cwd_watcher and not cwd_watcher:is_closing() then
+      cwd_watcher:close()
+      cwd_watcher = nil
+      log().dprint('Stopped CWD watcher.')
+    end
+    return -- Not in a git repo
+  end
+
+  -- Get initial state including gitdir, processed head, and raw head
+  local gitdir, head, raw_head = get_gitdir_and_head()
+  async().schedule() -- Ensure we run on the main loop
+
+  -- Check if we successfully got the repository info
+  if not gitdir then
+    log().dprint('Initial CWD head/gitdir determination failed (post .git check).')
     return
   end
 
-  local gitdir, head = get_gitdir_and_head()
-  async().schedule()
+  -- Determine initial detached state
+  local is_detached = (raw_head == 'HEAD')
 
+  -- *** Fire the initial GitSignsHeadChanged event ***
+  -- Trigger this *before* setting vim.g.gitsigns_head so the comparison
+  -- logic in the watcher's update_head doesn't rely on potentially stale state
+  -- if this function runs multiple times quickly (though unlikely with DirChanged debounce).
+  log().dprint('Firing initial GitSignsHeadChanged event for CWD.')
+  api.nvim_exec_autocmds('User', {
+    pattern = 'GitSignsHeadChanged',
+    modeline = false,
+    data = {
+      gitdir = gitdir,
+      head = head,
+      init = true,
+      old_head = nil, -- Explicitly nil for the initial event
+      detached = is_detached,
+    },
+  })
+
+  -- Set initial global state (used by watcher callback comparison and statuslines)
+  -- Do this *after* firing the initial event with old_head = nil
+  vim.g.gitsigns_head = head
+
+  -- Trigger general update (e.g., for statuslines that use GitSignsUpdate)
   api.nvim_exec_autocmds('User', {
     pattern = 'GitSignsUpdate',
     modeline = false,
   })
 
-  vim.g.gitsigns_head = head
-
-  if not gitdir then
+  -- Setup the watcher for subsequent changes
+  local towatch = gitdir .. '/HEAD'
+  -- Check if .git/HEAD exists before attempting to watch it
+  if not uv.fs_stat(towatch) then
+    log().dprintf('Cannot watch %s, file does not exist (likely initial commit needed).', towatch)
+    -- Stop watcher if it was watching something else
+    if cwd_watcher and not cwd_watcher:is_closing() then
+      cwd_watcher:close()
+      cwd_watcher = nil
+      log().dprint('Stopped CWD watcher as HEAD file missing.')
+    end
     return
   end
-
-  local towatch = gitdir .. '/HEAD'
-
+  -- Pass CWD and path to watch to the setup function
   setup_cwd_watcher(cwd, towatch)
 end
 
